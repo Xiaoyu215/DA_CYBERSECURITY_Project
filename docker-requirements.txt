@@ -11,3 +11,5 @@ lightgbm
 lief
 scikit-learn
 requests
+lief
+torch

@@ -1,44 +1,67 @@
 import os
-import envparse
+import sys
 from defender.apps import create_app
+from defender.models.whitebox_mlp_model import WhiteboxMLPEmberModel
 
-# CUSTOMIZE: import model to be used
-from defender.models.ember_model import StatefulNNEmberModel
-from defender.models.nfs_behemot_model import NFSBehemotModel
-#from defender.models.nfs_commite_model import NFSCommiteBehemotModel
-from defender.models.nfs_model import PEAttributeExtractor, NFSModel, NeedForSpeedModel
+HERE = os.path.dirname(__file__)
+def abspath(p): return p if os.path.isabs(p) else os.path.join(HERE, p)
 
-if __name__ == "__main__":
-    # retrive config values from environment variables
-    model_gz_path = envparse.env("DF_MODEL_GZ_PATH", cast=str, default="models/mymodel.txt.gz")
-    model_thresh = envparse.env("DF_MODEL_THRESH", cast=float, default=0.867142)
-    model_name = envparse.env("DF_MODEL_NAME", cast=str, default="ember")
-    model_ball_thresh = envparse.env("DF_MODEL_BALL_THRESH", cast=float, default=0.25)
-    model_max_history = envparse.env("DF_MODEL_HISTORY", cast=int, default=10_000)
-
-    # construct absolute path to ensure the correct model is loaded
-    if not model_gz_path.startswith(os.sep):
-        model_gz_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), model_gz_path)
-
-    # CUSTOMIZE: app and model instance
-    model = StatefulNNEmberModel(model_gz_path,
-                                 model_thresh,
-                                 model_ball_thresh,
-                                 model_max_history,
-                                 model_name)
+def build_app():
+    # default relative to this file
+    default_weights = "models/whitebox_mlp.pt"
+    cfg = os.getenv("DF_MODEL_GZ_PATH", default_weights)
+    model_path = abspath(cfg)  # << no extra "models/" prefixing here
     
-    # model = NFSBehemotModel()
-    # model = NFSCommiteBehemotModel()
-    # model = NFSModel(open(os.path.dirname(__file__) + "/models/nfs_full.pickle", "rb"))
-    # model = NFSModel(open(os.path.dirname(__file__) + "/models/nfs_libraries_functions_nostrings.pickle", "rb"))
+    print(f"Looking for model at: {model_path}")
+    if not os.path.exists(model_path):
+        print(f"Warning: Model file not found at {model_path}")
+        # Try alternative paths
+        alt_paths = [
+            os.path.join(HERE, "..", "models", "whitebox_mlp.pt"),
+            "/opt/defender/defender/models/whitebox_mlp.pt"
+        ]
+        for alt_path in alt_paths:
+            if os.path.exists(alt_path):
+                print(f"Found model at alternative path: {alt_path}")
+                model_path = alt_path
+                break
+        else:
+            raise FileNotFoundError(f"Could not find model file. Checked: {model_path}, {alt_paths}")
 
-    app = create_app(model)
+    thr = os.getenv("DF_MODEL_THRESH")
+    threshold = None
+    if thr:
+        try:
+            threshold = float(thr)
+        except ValueError:
+            print(f"Warning: Invalid threshold value '{thr}', using default")
+    
+    print(f"Initializing model with threshold: {threshold}")
+    model = WhiteboxMLPEmberModel(
+        model_gz_path=model_path,
+        model_thresh=threshold,
+        model_name=os.getenv("DF_MODEL_NAME", "whitebox_mlp"),
+    )
+    return create_app(model), model_path
 
-    import sys
-    port = int(sys.argv[1]) if len(sys.argv) == 2 else 8080
+def main():
+    try:
+        print("Starting defender application...")
+        app, model_path = build_app()
+        print(f"Model loaded from: {model_path}")
+        print("Starting Flask server on 0.0.0.0:8080...")
+        
+        # Use gevent for production-ready WSGI server
+        from gevent.pywsgi import WSGIServer
+        http_server = WSGIServer(('0.0.0.0', 8080), app)
+        print("Server ready to receive requests")
+        http_server.serve_forever()
+        
+    except Exception as e:
+        print(f"Error starting application: {e}", file=sys.stderr)
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
 
-    from gevent.pywsgi import WSGIServer
-    http_server = WSGIServer(('', port), app)
-    http_server.serve_forever()
-
-    # curl -XPOST --data-binary @somePEfile http://127.0.0.1:8080/ -H "Content-Type: application/octet-stream"
+if __name__ == '__main__':
+    main()

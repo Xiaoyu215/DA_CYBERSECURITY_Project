@@ -6,3 +6,6 @@ annoy
 numpy
 tqdm
 pefile
+requests
+joblib
+scikit-leran
