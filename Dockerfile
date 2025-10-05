@@ -1,4 +1,4 @@
-FROM python:3.12-slim
+FROM python:3.6-slim
 
 #############################
 # INSTALL PYTHON DEPENDENCIES
@@ -23,7 +23,7 @@ RUN pip install --no-cache-dir -r docker-requirements.txt \
 #############################
 
 # rebase to make a smaller image
-FROM python:3.12-slim
+FROM python:3.6-slim
 
 
 # copy python virtual env (all dependencies) from previous image
@@ -49,7 +49,7 @@ WORKDIR /opt/defender/
 # update environmental variables
 ENV PATH="/opt/venv/bin:$PATH"
 ENV PYTHONPATH="/opt/defender"
-
+ENV STRICT_EXTRACT="1"
 
 
 # one may tune model file / threshold / name via environmental variables

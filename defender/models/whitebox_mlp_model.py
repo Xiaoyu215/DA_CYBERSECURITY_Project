@@ -5,8 +5,6 @@ White-box MLP model adapter for the older HTTP template.
 - Loads: whitebox_mlp.pt, whitebox_scaler.joblib, whitebox_threshold.json, whitebox_model_meta.json
 - Extracts EMBER-style (2381-d) features from raw PE bytes via ember + LIEF.
 """
-
-from __future__ import annotations
 import json
 import os
 from pathlib import Path
@@ -28,7 +26,6 @@ META_PATH       = MODELS_DIR / "whitebox_model_meta.json"
 # If STRICT_EXTRACT=1, raise on extraction failure (HTTP 500).
 # Else, fall back to a zero vector (still returns a 0/1 decision).
 STRICT_EXTRACT = os.getenv("STRICT_EXTRACT", "0") == "1"
-
 
 # ----------------------- Model Adapter -----------------------
 class WhiteboxMLPEmberModel:
@@ -105,14 +102,10 @@ class WhiteboxMLPEmberModel:
         # ---- Feature extractor: EMBER (uses LIEF)
         self._ember_ok = False
         self.extractor = None
-        try:
-            import ember  # noqa: F401
-            # Delay import to here to avoid import errors at module import time
-            import ember as _ember
-            self.extractor = _ember.PEFeatureExtractor()
-            self._ember_ok = True
-        except Exception:
-            self._ember_ok = False  # You can vendor the extractor if needed
+
+        import ember as _ember
+        self.extractor = _ember.PEFeatureExtractor()
+        self._ember_ok = True
 
     # ----------------------- Public API -----------------------
     def predict(self, bytez: bytes) -> int:
@@ -120,12 +113,14 @@ class WhiteboxMLPEmberModel:
         Bytes in -> 0/1 out (0=benign, 1=malicious)
         """
         x = self._bytes_to_features(bytez).reshape(1, -1)
+        print("features",x)
         if self.scaler is not None:
             x = self.scaler.transform(x).astype(np.float32)
 
         with self.torch.no_grad():
             t = self.torch.from_numpy(x.astype(np.float32))
             prob = float(self.torch.sigmoid(self.model(t)).cpu().numpy().ravel()[0])
+        print(prob, self.threshold)
         return int(prob >= self.threshold)
 
     def model_info(self) -> Dict[str, Any]:
@@ -186,9 +181,10 @@ class WhiteboxMLPEmberModel:
                 else:
                     vec = self.extractor.extract(bytez)
                 v = np.asarray(vec, dtype=np.float32)
-
+                print("Feature vector:",v)
                 # Defensive pad/trim
                 if v.shape[0] != self.input_dim:
+                    print("ERROR dim mismatch", v.shape, self.input_dim)
                     vv = np.zeros((self.input_dim,), dtype=np.float32)
                     n = min(self.input_dim, v.shape[0]); vv[:n] = v[:n]
                     v = vv
