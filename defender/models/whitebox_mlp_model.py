@@ -5,8 +5,6 @@ White-box MLP model adapter for the older HTTP template.
 - Loads: whitebox_mlp.pt, whitebox_scaler.joblib, whitebox_threshold.json, whitebox_model_meta.json
 - Extracts EMBER-style (2381-d) features from raw PE bytes via ember + LIEF.
 """
-
-from __future__ import annotations
 import json
 import os
 from pathlib import Path
@@ -104,14 +102,10 @@ class WhiteboxMLPEmberModel:
         # ---- Feature extractor: EMBER (uses LIEF)
         self._ember_ok = False
         self.extractor = None
-        try:
-            import ember  # noqa: F401
-            # Delay import to here to avoid import errors at module import time
-            import ember as _ember
-            self.extractor = _ember.PEFeatureExtractor()
-            self._ember_ok = True
-        except Exception:
-            self._ember_ok = False  # You can vendor the extractor if needed
+
+        import ember as _ember
+        self.extractor = _ember.PEFeatureExtractor()
+        self._ember_ok = True
 
     # ----------------------- Public API -----------------------
     def predict(self, bytez: bytes) -> int:

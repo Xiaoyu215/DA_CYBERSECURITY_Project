@@ -17,7 +17,7 @@ def create_app(model):
 
         bytez = request.data
 
-        print(f"Recived file hash: {sha256(bytez)}")
+        print(f"Recived file hash: {sha256(bytez).digest()}")
 
         model = app.config['model']
 
