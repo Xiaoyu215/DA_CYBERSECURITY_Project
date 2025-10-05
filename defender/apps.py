@@ -1,3 +1,4 @@
+from hashlib import sha256
 from flask import Flask, jsonify, request
 
 
@@ -15,6 +16,8 @@ def create_app(model):
             return resp
 
         bytez = request.data
+
+        print(f"Recived file hash: {sha256(bytez)}")
 
         model = app.config['model']
 

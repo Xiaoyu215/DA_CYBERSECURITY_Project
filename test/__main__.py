@@ -1,4 +1,5 @@
 import argparse
+from hashlib import sha256
 from test import informational, measure_efficacy, MAXFILESIZE, TIMEOUT, TINYIMPORT, get_raw_result
 import json
 import pathlib

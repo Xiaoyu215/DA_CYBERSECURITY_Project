@@ -8,8 +8,7 @@ tqdm<5,>=4.60
 numpy
 pandas
 lightgbm
-lief
+lief==0.9.0
 scikit-learn
 requests
-lief
 torch

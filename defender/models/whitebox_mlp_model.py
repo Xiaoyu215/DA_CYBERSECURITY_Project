@@ -29,7 +29,6 @@ META_PATH       = MODELS_DIR / "whitebox_model_meta.json"
 # Else, fall back to a zero vector (still returns a 0/1 decision).
 STRICT_EXTRACT = os.getenv("STRICT_EXTRACT", "0") == "1"
 
-
 # ----------------------- Model Adapter -----------------------
 class WhiteboxMLPEmberModel:
     """
@@ -120,12 +119,14 @@ class WhiteboxMLPEmberModel:
         Bytes in -> 0/1 out (0=benign, 1=malicious)
         """
         x = self._bytes_to_features(bytez).reshape(1, -1)
+        print("features",x)
         if self.scaler is not None:
             x = self.scaler.transform(x).astype(np.float32)
 
         with self.torch.no_grad():
             t = self.torch.from_numpy(x.astype(np.float32))
             prob = float(self.torch.sigmoid(self.model(t)).cpu().numpy().ravel()[0])
+        print(prob, self.threshold)
         return int(prob >= self.threshold)
 
     def model_info(self) -> Dict[str, Any]:
@@ -186,9 +187,10 @@ class WhiteboxMLPEmberModel:
                 else:
                     vec = self.extractor.extract(bytez)
                 v = np.asarray(vec, dtype=np.float32)
-
+                print("Feature vector:",v)
                 # Defensive pad/trim
                 if v.shape[0] != self.input_dim:
+                    print("ERROR dim mismatch", v.shape, self.input_dim)
                     vv = np.zeros((self.input_dim,), dtype=np.float32)
                     n = min(self.input_dim, v.shape[0]); vv[:n] = v[:n]
                     v = vv
