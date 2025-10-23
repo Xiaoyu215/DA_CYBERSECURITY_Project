@@ -1,7 +1,14 @@
 {
-  "input_dim": 2381,
+  "feature_version": "ember_v3_pe",
+  "input_dim": 2568,
   "hidden_dims": [
     512,
     256
-  ]
+  ],
+  "pgd": {
+    "eps_value": 0.5,
+    "steps": 7
+  },
+  "epochs": 6,
+  "batch": 2048
 }

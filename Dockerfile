@@ -1,4 +1,4 @@
-FROM python:3.6-slim
+FROM python:3.12-slim
 
 #############################
 # INSTALL PYTHON DEPENDENCIES
@@ -8,24 +8,38 @@ FROM python:3.6-slim
 RUN apt-get -o Acquire::Max-FutureTime=100000 update \
  && apt-get install -y --no-install-recommends build-essential git
 
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      build-essential git libgomp1 \
+ && rm -rf /var/lib/apt/lists/*
+
 # create a virtual environment
 RUN python -m venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
 
 # copy and install python requirements + ember from github
-COPY docker-requirements.txt .
-RUN pip install --no-cache-dir -r docker-requirements.txt \
- && pip install --no-cache-dir git+https://github.com/endgameinc/ember.git
+# copy requirements to /tmp
+COPY docker-requirements.txt /tmp/requirements.txt
 
+# install: torch first from CPU index, then the rest (with numpy/signify pins)
+RUN pip install --upgrade pip setuptools wheel \
+ && pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cpu torch==2.2.2 \
+ && pip install --no-cache-dir -r /tmp/requirements.txt \
+ && pip cache purge
 
 #############################
 # REBASE & DEPLOY CODE
 #############################
 
 # rebase to make a smaller image
-FROM python:3.6-slim
+FROM python:3.12-slim
 
-
+# runtime OS libs needed by lightgbm / torch (OpenMP)
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      libgomp1 libstdc++6 \
+ && rm -rf /var/lib/apt/lists/*
+ 
 # copy python virtual env (all dependencies) from previous image
 COPY --from=0 /opt/venv /opt/venv
 
@@ -51,15 +65,10 @@ ENV PATH="/opt/venv/bin:$PATH"
 ENV PYTHONPATH="/opt/defender"
 ENV STRICT_EXTRACT="1"
 
-
-# one may tune model file / threshold / name via environmental variables
-ENV THRESHOLD_ENV=0.609
-
-
 #############################
 # RUN CODE
 #############################
-CMD ["python","-m","defender"]
+CMD ["python","-u","-m","defender"]
 
 ## TO BUILD IMAGE:
 # docker build -t ember .

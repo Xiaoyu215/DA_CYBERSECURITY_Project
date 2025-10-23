@@ -1,37 +1,26 @@
-# whitebox.py
-"""
-White-box MLP model adapter for the older HTTP template.
-- Exposes WhiteboxMLPEmberModel with predict(bytez)->0/1 and model_info().
-- Loads: whitebox_mlp.pt, whitebox_scaler.joblib, whitebox_threshold.json, whitebox_model_meta.json
-- Extracts EMBER-style (2381-d) features from raw PE bytes via ember + LIEF.
-"""
-import json
-import os
+# whitebox.py (thrember v3, 2568-d)
+import json, os
 from pathlib import Path
 from typing import Dict, Any, Optional
-
 import numpy as np
 import joblib
+from thrember.features import PEFeatureExtractor
 
-# ----------------------- Config / Paths -----------------------
 HERE = Path(__file__).resolve().parent
-MODELS_DIR = HERE
+MODELS_DIR = HERE  # all artifacts live here
 
 WEIGHTS_DEFAULT = MODELS_DIR / "whitebox_mlp.pt"
-SCALER_PATH     = MODELS_DIR / "whitebox_scaler.joblib"
+SCALER_JSON     = MODELS_DIR / "whitebox_scaler_params.json"   # preferred
+SCALER_JOBLIB   = MODELS_DIR / "whitebox_scaler.joblib"        # optional fallback
 THRESH_PATH     = MODELS_DIR / "whitebox_threshold.json"
 META_PATH       = MODELS_DIR / "whitebox_model_meta.json"
 
-# Extraction policy:
-# If STRICT_EXTRACT=1, raise on extraction failure (HTTP 500).
-# Else, fall back to a zero vector (still returns a 0/1 decision).
-STRICT_EXTRACT = os.getenv("STRICT_EXTRACT", "0") == "1"
+STRICT_EXTRACT = os.getenv("STRICT_EXTRACT", "1") == "1"
 
-# ----------------------- Model Adapter -----------------------
 class WhiteboxMLPEmberModel:
     """
-    Constructor signature mirrors the template's Ember model so main.py changes are minimal.
-    Only model_gz_path and model_thresh are actually used.
+    White-box MLP adapter compatible with the template.
+    Uses EMBER2024/thrember PE v3 features at inference.
     """
     def __init__(
         self,
@@ -43,39 +32,46 @@ class WhiteboxMLPEmberModel:
     ) -> None:
         self.name = model_name
 
-        # ---- Threshold
-        self.threshold = float(model_thresh) if model_thresh is not None else 0.5
-        try:
-            obj = json.loads(THRESH_PATH.read_text())
-            self.threshold = float(obj.get("threshold", self.threshold))
-            print(f"[whitebox] Loaded threshold from {THRESH_PATH}: {self.threshold}")
-        except Exception as e:
-            raise RuntimeError(f"[whitebox] threshold reading error {THRESH_PATH}: {e}")
-
-        # ---- Scaler
-        try:
-            self.scaler = joblib.load(SCALER_PATH)
-        except Exception as e:
-            raise RuntimeError(f"[whitebox] scaler reading error {SCALER_PATH}: {e}")
-        # ---- Meta (must match training architecture)
-        meta = {"input_dim": 2381, "hidden_dims": [512, 256]}
-        try:
+        # --- Load meta, enforce feature schema ---
+        meta = {"feature_version": "ember_v3_pe", "input_dim": 2568, "hidden_dims": [512, 256]}
+        if META_PATH.exists():
             meta.update(json.loads(META_PATH.read_text()))
-        except Exception as e:
-            raise RuntimeError(f"[whitebox] meta data reading error {META_PATH}: {e}")
-        self.input_dim: int = int(meta["input_dim"])
-        self.hidden_dims = list(meta["hidden_dims"])
+        self.feature_version = str(meta.get("feature_version", "ember_v3_pe"))
+        self.input_dim: int  = int(meta.get("input_dim", 2568))
+        self.hidden_dims     = list(meta.get("hidden_dims", [512, 256]))
 
-        # Optional sanity check: scaler feature count
-        if self.scaler is not None:
+        if self.feature_version != "ember_v3_pe":
+            raise RuntimeError(f"Feature version mismatch: expected 'ember_v3_pe', got '{self.feature_version}'")
+
+        # --- Threshold (val@1%FPR recommended) ---
+        self.threshold = float(model_thresh) if model_thresh is not None else 0.5
+        if THRESH_PATH.exists():
+            try:
+                obj = json.loads(THRESH_PATH.read_text())
+                self.threshold = float(obj.get("threshold", self.threshold))
+            except Exception as e:
+                raise RuntimeError(f"[whitebox] failed to read threshold {THRESH_PATH}: {e}")
+
+        # --- Scaler: prefer JSON mean/scale (version-proof); fallback to joblib if present ---
+        self.scaler_mean = None
+        self.scaler_scale = None
+        if SCALER_JSON.exists():
+            ps = json.loads(SCALER_JSON.read_text())
+            self.scaler_mean  = np.asarray(ps["mean"],  dtype=np.float32)
+            self.scaler_scale = np.asarray(ps["scale"], dtype=np.float32)
+            if self.scaler_mean.size != self.input_dim or self.scaler_scale.size != self.input_dim:
+                raise RuntimeError("Scaler JSON size mismatch with input_dim")
+            self.scaler = None  # use arrays
+        elif SCALER_JOBLIB.exists():
+            self.scaler = joblib.load(SCALER_JOBLIB)
             n_in = getattr(self.scaler, "n_features_in_", len(getattr(self.scaler, "mean_", [])))
             if n_in != self.input_dim:
                 raise RuntimeError(f"Scaler expects {n_in} features but meta says {self.input_dim}")
+        else:
+            raise RuntimeError("No scaler found (need whitebox_scaler_params.json or whitebox_scaler.joblib)")
 
-        # ---- Build MLP and load checkpoint
-        import torch
-        import torch.nn as nn
-
+        # --- Build MLP and load weights ---
+        import torch, torch.nn as nn
         class MLP(nn.Module):
             def __init__(self, d: int, hs):
                 super().__init__()
@@ -85,113 +81,115 @@ class WhiteboxMLPEmberModel:
                     last = h
                 layers += [nn.Linear(last, 1)]
                 self.net = nn.Sequential(*layers)
-
-            def forward(self, x):
-                return self.net(x).squeeze(-1)
+            def forward(self, x): return self.net(x).squeeze(-1)
 
         self.torch = torch
         self.model = MLP(self.input_dim, self.hidden_dims)
 
-        weights_path = Path(model_gz_path)
-        if not weights_path.exists():
-            weights_path = WEIGHTS_DEFAULT
+        weights_path = WEIGHTS_DEFAULT
         self._load_checkpoint(weights_path)
-
         self.model.eval()
 
-        # ---- Feature extractor: EMBER (uses LIEF)
-        self._ember_ok = False
-        self.extractor = None
+        # --- Feature extractor: thrember (EMBER2024 v3 PE) ---
+        try:
+            import thrember
+            self._thrember = thrember
+            self._extract_ok = True
+            self.extractor = PEFeatureExtractor()
+        except Exception as e:
+            self._thrember = None
+            self._extract_ok = False
+            if STRICT_EXTRACT:
+                raise RuntimeError(f"thrember import failed: {e}")
 
-        import ember as _ember
-        self.extractor = _ember.PEFeatureExtractor()
-        self._ember_ok = True
-
-    # ----------------------- Public API -----------------------
+    # ----- Public API -----
     def predict(self, bytez: bytes) -> int:
-        """
-        Bytes in -> 0/1 out (0=benign, 1=malicious)
-        """
-        x = self._bytes_to_features(bytez).reshape(1, -1)
-        print("features",x)
-        if self.scaler is not None:
-            x = self.scaler.transform(x).astype(np.float32)
 
+        v = self._bytes_to_features(bytez)  
+        print(v)
+        x = self._scale(v.reshape(1, -1))   
+
+        # torch inference
         with self.torch.no_grad():
             t = self.torch.from_numpy(x.astype(np.float32))
-            prob = float(self.torch.sigmoid(self.model(t)).cpu().numpy().ravel()[0])
-        print(prob, self.threshold)
+            logits = self.model(t)
+            if not self.torch.isfinite(logits).all():
+                raise RuntimeError("Non-finite logits from model")
+            prob = float(self.torch.sigmoid(logits).cpu().numpy().ravel()[0])
+
+        if not (0.0 <= prob <= 1.0) or not np.isfinite(prob):
+            raise RuntimeError(f"Invalid probability {prob}")
+
         return int(prob >= self.threshold)
 
     def model_info(self) -> Dict[str, Any]:
         return {
             "name": self.name,
+            "feature_version": self.feature_version,
             "input_dim": self.input_dim,
             "hidden_dims": self.hidden_dims,
             "threshold": float(self.threshold),
-            "has_scaler": bool(self.scaler is not None),
-            "ember_extractor": bool(self._ember_ok),
+            "has_scaler_json": bool(self.scaler_mean is not None),
+            "has_scaler_joblib": bool(SCALER_JOBLIB.exists()),
+            "extractor": "thrember",
+            "extractor_ok": bool(self._extract_ok),
         }
 
-    # ----------------------- Internals -----------------------
+    # ----- Internals -----
+    def _scale(self, X: np.ndarray) -> np.ndarray:
+        if self.scaler_mean is not None:
+            return (X - self.scaler_mean) / self.scaler_scale
+        else:
+            return self.scaler.transform(X).astype(np.float32)
+    
+
     def _load_checkpoint(self, path: Path) -> None:
-        """
-        Robustly load:
-          - pure state_dict
-          - {"state_dict": ...}
-          - full nn.Module saved with torch.save(model, ...)
-          - TorchScript module
-        Also strips a leading 'module.' (DataParallel) prefix if present.
-        """
         ckpt = self.torch.load(path, map_location="cpu")
 
-        def _strip_module(sd):
+        def strip_module(sd):
             return { (k[7:] if k.startswith("module.") else k): v for k, v in sd.items() }
 
-        loaded = False
         if isinstance(ckpt, dict) and "state_dict" in ckpt:
-            sd = _strip_module(ckpt["state_dict"])
-            try:
-                self.model.load_state_dict(sd, strict=True); loaded = True
-            except Exception:
-                self.model.load_state_dict(sd, strict=False); loaded = True
+            sd = strip_module(ckpt["state_dict"])
+            try: self.model.load_state_dict(sd, strict=True)
+            except Exception: self.model.load_state_dict(sd, strict=False)
         elif isinstance(ckpt, dict):
-            sd = _strip_module(ckpt)
-            try:
-                self.model.load_state_dict(sd, strict=True); loaded = True
-            except Exception:
-                self.model.load_state_dict(sd, strict=False); loaded = True
+            sd = strip_module(ckpt)
+            try: self.model.load_state_dict(sd, strict=True)
+            except Exception: self.model.load_state_dict(sd, strict=False)
         elif isinstance(ckpt, self.torch.jit.ScriptModule):
-            self.model = ckpt; loaded = True
+            self.model = ckpt
         else:
-            # Full nn.Module
-            self.model = ckpt; loaded = True
-
-        if not loaded:
-            raise RuntimeError("Could not load weights: incompatible state_dict/module")
+            self.model = ckpt  # full module
 
     def _bytes_to_features(self, bytez: bytes) -> np.ndarray:
         """
-        Raw PE bytes -> EMBER-style vector (2381-d by default).
+        Raw PE bytes -> EMBER v3 (2568-d) feature vector using Thrember.
         """
-        if self._ember_ok and self.extractor is not None:
+        if self._extract_ok:
             try:
-                if hasattr(self.extractor, "feature_vector"):
-                    vec = self.extractor.feature_vector(bytez)
-                else:
-                    vec = self.extractor.extract(bytez)
+                vec = self.extractor.feature_vector(bytez)
                 v = np.asarray(vec, dtype=np.float32)
-                print("Feature vector:",v)
-                # Defensive pad/trim
+
+                # Defensive pad/trim to expected dim
                 if v.shape[0] != self.input_dim:
-                    print("ERROR dim mismatch", v.shape, self.input_dim)
                     vv = np.zeros((self.input_dim,), dtype=np.float32)
-                    n = min(self.input_dim, v.shape[0]); vv[:n] = v[:n]
+                    n = min(self.input_dim, v.shape[0])
+                    vv[:n] = v[:n]
                     v = vv
                 return v
             except Exception as e:
                 if STRICT_EXTRACT:
-                    raise RuntimeError(f"feature extraction failed: {e}")
+                    # Force HTTP 500 via the Flask app — expected in strict mode
+                    raise RuntimeError("feature extraction failed") from e
 
-        # Fallback: zero vector (keeps API responsive)
+        # Fallback (STRICT_EXTRACT=0): zero vector to keep API responsive
         return np.zeros((self.input_dim,), dtype=np.float32)
+
+
+    def _pad_or_trim(self, v: np.ndarray) -> np.ndarray:
+        if v.shape[0] == self.input_dim:
+            return v
+        out = np.zeros((self.input_dim,), dtype=np.float32)
+        n = min(self.input_dim, v.shape[0]); out[:n] = v[:n]
+        return out
